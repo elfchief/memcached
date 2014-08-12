@@ -107,6 +107,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     int tries = 5;
     int tried_alloc = 0;
     item *search;
+    item *temp_it = NULL;
     void *hold_lock = NULL;
     rel_time_t oldest_live = settings.oldest_live;
 
@@ -114,6 +115,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     /* We walk up *only* for locked items. Never searching for expired.
      * Waste of CPU for almost all deployments */
     for (; tries > 0 && search != NULL; tries--, search=search->prev) {
+retry_search:
         if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
             /* We are a crawler, ignore it. */
             tries++;
@@ -128,10 +130,17 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             continue;
         /* Now see if the item is refcount locked */
         if (refcount_incr(&search->refcount) != 2) {
+            temp_it = search->prev;
+            /* Try to avoid a pathological case where long-refcountd objects
+             * (say waiting to write to network) sit at the bottom of the LRU
+             * TODO: add a stat counter for this
+             */
+            do_item_update_nolock(search);
             refcount_decr(&search->refcount);
             /* Old rare bug could cause a refcount leak. We haven't seen
              * it in years, but we leave this code in to prevent failures
              * just in case */
+
             if (settings.tail_repair_time &&
                     search->time + settings.tail_repair_time < current_time) {
                 itemstats[id].tailrepairs++;
@@ -140,7 +149,15 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             }
             if (hold_lock)
                 item_trylock_unlock(hold_lock);
-            continue;
+
+            /* search->prev ends up NULL due to update_nolock above, so we
+             * run the loop here. */
+            search = temp_it;
+            if (search) {
+                goto retry_search;
+            } else {
+                break;
+            }
         }
 
         /* Expired or flushed */
@@ -372,6 +389,19 @@ void do_item_update(item *it) {
             item_link_q(it);
         }
         mutex_unlock(&cache_lock);
+    }
+}
+
+void do_item_update_nolock(item *it) {
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            item_unlink_q(it);
+            it->time = current_time;
+            item_link_q(it);
+        }
     }
 }
 
